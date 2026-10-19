@@ -9,7 +9,10 @@ import android.content.pm.PackageManager
 import android.content.res.Configuration
 import android.os.Build
 import android.os.Bundle
+import android.os.Handler
 import android.os.IBinder
+import android.os.Looper
+import android.util.Log
 import android.util.Rational
 import android.view.WindowManager
 import androidx.activity.ComponentActivity
@@ -38,6 +41,14 @@ class MainActivity : ComponentActivity() {
     private val viewModel: MainViewModel by viewModels()
     private var service: AirPlayService? = null
     val isInPip = mutableStateOf(false)
+    // true when the receiver started this activity for a session, cleared once it steps aside
+    private var sessionSummoned = false
+    // true while a summon intent that brought this screen forward is being resumed
+    private var summonPending = false
+    // true once the screen is fully in the back, so a manual reopen can clear a stale summon
+    private var wasStopped = false
+    private var returnPending = false
+    private val retreatHandler = Handler(Looper.getMainLooper())
     private val logCallback: (String) -> Unit = { viewModel.addLog(it) }
     private val pinCallback: (String?) -> Unit = { viewModel.showPin(it) }
 
@@ -64,6 +75,10 @@ class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         enableEdgeToEdge()
+        val summoned = intent?.getBooleanExtra(AirPlayService.EXTRA_SESSION_SUMMON, false) == true
+        sessionSummoned = summoned
+        summonPending = summoned
+        Log.i(SUMMON_TAG, "create: summon=$summoned")
 
         val missing = buildList {
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU && !_granted(Manifest.permission.POST_NOTIFICATIONS)) {
@@ -95,6 +110,21 @@ class MainActivity : ComponentActivity() {
             }
         }
 
+        // step aside when the last sender disconnects, only for receiver-summoned sessions
+        lifecycleScope.launch {
+            repeatOnLifecycle(Lifecycle.State.STARTED) {
+                var previous: Int? = null
+                viewModel.connectionCount.collect { count ->
+                    val was = previous
+                    previous = count
+                    when {
+                        was != null && was > 0 && count == 0 -> _scheduleReturnToPrevious()
+                        count > 0 -> _cancelReturnToPrevious()
+                    }
+                }
+            }
+        }
+
         // auto-enter pre-declared in pip params
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
             lifecycleScope.launch {
@@ -122,6 +152,18 @@ class MainActivity : ComponentActivity() {
         }
     }
 
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        setIntent(intent)
+        val summoned = intent.getBooleanExtra(AirPlayService.EXTRA_SESSION_SUMMON, false)
+        Log.i(SUMMON_TAG, "new intent: summon=$summoned")
+        // a plain bring-to-front leaves the current state alone; only a real summon marks the screen
+        if (summoned) {
+            sessionSummoned = true
+            summonPending = true
+        }
+    }
+
     private fun _granted(permission: String) =
         ContextCompat.checkSelfPermission(this, permission) == PackageManager.PERMISSION_GRANTED
 
@@ -136,6 +178,37 @@ class MainActivity : ComponentActivity() {
         if (service?.serverState?.value == AirPlayService.ServerState.RUNNING) {
             startService(Intent(this, AirPlayService::class.java))
         }
+    }
+
+    // move the receiver behind whatever was on screen, so the previous app or the launcher comes
+    // back. edge-triggered on the last disconnect and skipped for manual launches.
+    private fun _scheduleReturnToPrevious() {
+        if (!sessionSummoned) {
+            Log.i(SUMMON_TAG, "session ended: not summoned, staying")
+            return
+        }
+        if (!viewModel.pref(Prefs.RETURN_ON_DISCONNECT).value) {
+            Log.i(SUMMON_TAG, "session ended: setting off, staying")
+            return
+        }
+        returnPending = true
+        Log.i(SUMMON_TAG, "session ended: returning in ${SESSION_END_RETURN_GRACE_MS}ms")
+        retreatHandler.postDelayed({
+            if (returnPending && !isFinishing && !isDestroyed && viewModel.connectionCount.value == 0) {
+                returnPending = false
+                sessionSummoned = false
+                Log.i(SUMMON_TAG, "moving task to back")
+                moveTaskToBack(true)
+            }
+        }, SESSION_END_RETURN_GRACE_MS)
+    }
+
+    // a new sender inside the grace (for example switching videos) keeps the screen
+    private fun _cancelReturnToPrevious() {
+        if (!returnPending) return
+        returnPending = false
+        Log.i(SUMMON_TAG, "new sender inside grace, staying")
+        retreatHandler.removeCallbacksAndMessages(null)
     }
 
     private fun _syncLocalNetwork(requested: Boolean = false) {
@@ -159,6 +232,22 @@ class MainActivity : ComponentActivity() {
         } else {
             permissions.launch(arrayOf(Manifest.permission.ACCESS_LOCAL_NETWORK))
         }
+    }
+
+    override fun onResume() {
+        super.onResume()
+        isOnScreen = true
+        Log.i(SUMMON_TAG, "resume: summonPending=$summonPending sessionSummoned=$sessionSummoned wasStopped=$wasStopped")
+        // a resume from the back with no summon intent means the user brought the app up themselves
+        if (!summonPending && wasStopped) sessionSummoned = false
+        summonPending = false
+        wasStopped = false
+    }
+
+    override fun onPause() {
+        super.onPause()
+        isOnScreen = false
+        summonPending = false
     }
 
     override fun onStart() {
@@ -199,6 +288,7 @@ class MainActivity : ComponentActivity() {
 
     override fun onStop() {
         super.onStop()
+        wasStopped = true
         // never stop mid-session
         if (!viewModel.pref(Prefs.RUN_IN_BACKGROUND).value && !isChangingConfigurations &&
             viewModel.serverState.value == AirPlayService.ServerState.RUNNING &&
@@ -213,6 +303,15 @@ class MainActivity : ComponentActivity() {
             if (it.pinCallback === pinCallback) it.pinCallback = null
         }
         unbindService(connection)
+        retreatHandler.removeCallbacksAndMessages(null)
         super.onDestroy()
+    }
+
+    companion object {
+        // brief holdoff so a quick stop/play in the sender does not flash the screen below
+        private const val SESSION_END_RETURN_GRACE_MS = 2_000L
+        private const val SUMMON_TAG = "AirPlaySummon"
+        // the receiver service reads this to tell a real summon from a launch over a visible app
+        @Volatile var isOnScreen = false
     }
 }

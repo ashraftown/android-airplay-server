@@ -1144,8 +1144,17 @@ class AirPlayService : LifecycleService(), RaopCallbackHandler, LogListener {
 
     private fun launchMainActivity() {
         Handler(Looper.getMainLooper()).post {
+            // only a launch that brings a backgrounded screen forward counts as a summon; if the
+            // user is already looking at the app, ending the session must not bounce them out
+            val onScreen = MainActivity.isOnScreen
             val launchIntent = Intent(this, MainActivity::class.java)
                 .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_REORDER_TO_FRONT)
+            if (onScreen) {
+                launchIntent.removeExtra(EXTRA_SESSION_SUMMON)
+            } else {
+                launchIntent.putExtra(EXTRA_SESSION_SUMMON, true)
+            }
+            Log.i(TAG, "launch on connect: activityOnScreen=$onScreen summon=${!onScreen}")
             try {
                 startActivity(launchIntent)
             } catch (e: Exception) {
@@ -1187,6 +1196,9 @@ class AirPlayService : LifecycleService(), RaopCallbackHandler, LogListener {
         const val ACTION_NEXT = "io.github.jqssun.airplay.NEXT"
         const val ACTION_PREV = "io.github.jqssun.airplay.PREV"
         const val ACTION_START_SERVER = "io.github.jqssun.airplay.START_SERVER"
+        // marks an activity launch the receiver started for a session, so the activity can step
+        // aside again when the last sender disconnects; never set on a manual app launch
+        const val EXTRA_SESSION_SUMMON = "io.github.jqssun.airplay.SESSION_SUMMON"
         // shared with dpad/double-tap seeks
         const val VIDEO_SEEK_STEP_MS = 10_000L
         const val VIDEO_POLL_PENDING_TIMEOUT_MS = 3_000L
